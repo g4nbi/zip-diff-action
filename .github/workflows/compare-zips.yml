@@ -1,0 +1,166 @@
+name: Compare Two ZIPs
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip1_path:
+        description: 'Path ke ZIP pertama (relatif dari root repo)'
+        required: true
+        default: 'zip1.zip'
+      zip2_path:
+        description: 'Path ke ZIP kedua (relatif dari root repo)'
+        required: true
+        default: 'zip2.zip'
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check ZIP files exist
+        run: |
+          if [ ! -f "${{ inputs.zip1_path }}" ]; then
+            echo "❌ File tidak ditemukan: ${{ inputs.zip1_path }}"
+            exit 1
+          fi
+          if [ ! -f "${{ inputs.zip2_path }}" ]; then
+            echo "❌ File tidak ditemukan: ${{ inputs.zip2_path }}"
+            exit 1
+          fi
+          echo "✅ Kedua ZIP ditemukan"
+
+      - name: Extract and compare ZIPs
+        id: compare
+        run: |
+          set -euo pipefail
+
+          ZIP1="${{ inputs.zip1_path }}"
+          ZIP2="${{ inputs.zip2_path }}"
+
+          DIR1=$(mktemp -d)
+          DIR2=$(mktemp -d)
+
+          echo "📦 Mengekstrak $ZIP1 ..."
+          unzip -q "$ZIP1" -d "$DIR1"
+
+          echo "📦 Mengekstrak $ZIP2 ..."
+          unzip -q "$ZIP2" -d "$DIR2"
+
+          # Buat list file relatif (exclude folder kosong)
+          (cd "$DIR1" && find . -type f | sort > /tmp/files1.txt)
+          (cd "$DIR2" && find . -type f | sort > /tmp/files2.txt)
+
+          # Hanya di ZIP1
+          ONLY1=$(comm -23 /tmp/files1.txt /tmp/files2.txt)
+          # Hanya di ZIP2
+          ONLY2=$(comm -13 /tmp/files1.txt /tmp/files2.txt)
+          # Ada di keduanya
+          COMMON=$(comm -12 /tmp/files1.txt /tmp/files2.txt)
+
+          DIFFERENT=""
+          SAME_COUNT=0
+
+          while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            HASH1=$(sha256sum "$DIR1/$rel" | awk '{print $1}')
+            HASH2=$(sha256sum "$DIR2/$rel" | awk '{print $1}')
+            if [ "$HASH1" != "$HASH2" ]; then
+              DIFFERENT="${DIFFERENT}${rel}\n"
+            else
+              SAME_COUNT=$((SAME_COUNT + 1))
+            fi
+          done <<< "$COMMON"
+
+          ONLY1_COUNT=$(echo "$ONLY1" | grep -c . || true)
+          ONLY2_COUNT=$(echo "$ONLY2" | grep -c . || true)
+          DIFF_COUNT=$(echo -e "$DIFFERENT" | grep -c . || true)
+
+          # === Tulis ke Job Summary ===
+          {
+            echo "### 📊 Hasil Perbandingan ZIP"
+            echo ""
+            echo "| Kategori | Jumlah |"
+            echo "|----------|--------|"
+            echo "| Hanya di ZIP 1 | $ONLY1_COUNT |"
+            echo "| Hanya di ZIP 2 | $ONLY2_COUNT |"
+            echo "| Isi berbeda | $DIFF_COUNT |"
+            echo "| Isi sama | $SAME_COUNT |"
+            echo ""
+
+            if [ "$ONLY1_COUNT" -gt 0 ]; then
+              echo "### 🟦 Hanya ada di ZIP 1 (\"${ZIP1}\")"
+              echo '```'
+              echo "$ONLY1"
+              echo '```'
+              echo ""
+            fi
+
+            if [ "$ONLY2_COUNT" -gt 0 ]; then
+              echo "### 🟩 Hanya ada di ZIP 2 (\"${ZIP2}\")"
+              echo '```'
+              echo "$ONLY2"
+              echo '```'
+              echo ""
+            fi
+
+            if [ "$DIFF_COUNT" -gt 0 ]; then
+              echo "### 🔴 File dengan isi berbeda"
+              echo '```'
+              echo -e "$DIFFERENT"
+              echo '```'
+              echo ""
+            fi
+
+            if [ "$ONLY1_COUNT" -eq 0 ] && [ "$ONLY2_COUNT" -eq 0 ] && [ "$DIFF_COUNT" -eq 0 ]; then
+              echo "### ✅ Kedua ZIP memiliki isi yang sama persis"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Simpan juga ke file untuk artifact
+          {
+            echo "# Hasil Perbandingan ZIP"
+            echo ""
+            echo "ZIP 1: $ZIP1"
+            echo "ZIP 2: $ZIP2"
+            echo ""
+            echo "Hanya di ZIP 1: $ONLY1_COUNT"
+            echo "Hanya di ZIP 2: $ONLY2_COUNT"
+            echo "Isi berbeda   : $DIFF_COUNT"
+            echo "Isi sama      : $SAME_COUNT"
+            echo ""
+            if [ -n "$ONLY1" ]; then
+              echo "## Hanya di ZIP 1"
+              echo "$ONLY1"
+              echo ""
+            fi
+            if [ -n "$ONLY2" ]; then
+              echo "## Hanya di ZIP 2"
+              echo "$ONLY2"
+              echo ""
+            fi
+            if [ -n "$DIFFERENT" ]; then
+              echo "## File isi berbeda"
+              echo -e "$DIFFERENT"
+            fi
+          } > compare-result.txt
+
+          echo "only1=$ONLY1_COUNT" >> $GITHUB_OUTPUT
+          echo "only2=$ONLY2_COUNT" >> $GITHUB_OUTPUT
+          echo "diff=$DIFF_COUNT" >> $GITHUB_OUTPUT
+          echo "same=$SAME_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Upload hasil perbandingan
+        uses: actions/upload-artifact@v4
+        with:
+          name: compare-result
+          path: compare-result.txt
+
+      - name: Print ringkasan
+        run: |
+          echo "Selesai!"
+          echo "Hanya di ZIP1 : ${{ steps.compare.outputs.only1 }}"
+          echo "Hanya di ZIP2 : ${{ steps.compare.outputs.only2 }}"
+          echo "Isi berbeda   : ${{ steps.compare.outputs.diff }}"
+          echo "Isi sama      : ${{ steps.compare.outputs.same }}"
